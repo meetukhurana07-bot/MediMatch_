@@ -16,25 +16,38 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from google import genai
 from google.genai import types
 
-# ── Load API key from .env file (so you don't re-enter it every time) ──────────
+# ── Load API key (Streamlit Cloud secrets > .env file > OS env var) ───────────
 def _load_env_key() -> str:
-    """Read GEMINI_API_KEY from .env file if it exists, else from env vars."""
-    # Try st.secrets first (Streamlit Cloud)
+    """
+    Priority:
+      1. Streamlit Cloud st.secrets["GEMINI_API_KEY"]
+      2. Local .env file  GEMINI_API_KEY=...
+      3. OS environment variable GEMINI_API_KEY
+    Returns empty string if none found.
+    """
+    # 1. Streamlit Cloud secrets (must be called after set_page_config)
     try:
-        return st.secrets["GEMINI_API_KEY"]
+        val = st.secrets.get("GEMINI_API_KEY", "")
+        if val:
+            return str(val).strip()
     except Exception:
         pass
-    # Try .env file (local development)
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
+
+    # 2. Local .env file
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("GEMINI_API_KEY"):
-                    parts = line.split("=", 1)
-                    if len(parts) == 2:
-                        return parts[1].strip().strip('"').strip("'")
-    # Try OS environment variable
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("GEMINI_API_KEY") and "=" in line:
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val and val != "your_api_key_here":
+                            return val
+        except Exception:
+            pass
+
+    # 3. OS environment variable
     return os.environ.get("GEMINI_API_KEY", "")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -360,15 +373,28 @@ st.set_page_config(page_title="MediMatch — Blood & Organ Donation",
                    page_icon="🩸", layout="wide", initial_sidebar_state="expanded")
 init_db()
 
-for k, v in [("gemini_api_key", _load_env_key()),("api_key_validated",False),
-             ("chat_history",[]),("active_page","🏠 Home"),("chat_messages",[])]:
+# Initialise session state defaults (only on first load per session)
+_defaults = [("api_key_validated", False), ("chat_history", []),
+             ("active_page", "🏠 Home"), ("chat_messages", [])]
+for k, v in _defaults:
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Auto-validate if key was loaded from .env and not yet validated
+# Always refresh the API key from secrets/.env on every page load
+# This ensures Streamlit Cloud secrets are picked up automatically
+_env_key = _load_env_key()
+if _env_key:
+    # Override with env key if the user hasn't manually typed a different one
+    if not st.session_state.get("gemini_api_key") or not st.session_state.get("api_key_validated"):
+        st.session_state.gemini_api_key = _env_key
+else:
+    if "gemini_api_key" not in st.session_state:
+        st.session_state.gemini_api_key = ""
+
+# Auto-validate silently if key is present and not yet validated
 if st.session_state.gemini_api_key and not st.session_state.api_key_validated:
-    ok, _ = validate_api_key(st.session_state.gemini_api_key)
-    st.session_state.api_key_validated = ok
+    _ok, _ = validate_api_key(st.session_state.gemini_api_key)
+    st.session_state.api_key_validated = _ok
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -944,6 +970,99 @@ elif page == "📋 Manage Records":
     st.title("📋 Manage Records")
     st.markdown("View, edit, and manage all donors, requests, and match history.")
 
+    # ── Cloud persistence notice + data import ────────────────────────────────
+    import io
+    _is_cloud = "STREAMLIT_SHARING_MODE" in os.environ or os.environ.get("HOME", "") == "/home/appuser"
+    if _is_cloud:
+        st.warning(
+            "⚠️ **Streamlit Cloud resets data on every redeploy.** "
+            "Use **Export** to save your data as CSV, and **Import** to restore it after a reset."
+        )
+
+    with st.expander("💾 Backup & Restore Data", expanded=False):
+        st.markdown("### Export")
+        db = get_session()
+        _exp_donors = db.query(Donor).all()
+        _exp_reqs   = db.query(UrgentRequest).all()
+        db.close()
+
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            if _exp_donors:
+                _d_rows = [{"name":d.name,"age":d.age,"blood_type":d.blood_type,
+                            "email":d.email,"phone":d.phone,"city":d.city,"state":d.state,
+                            "donation_types":d.donation_types,"medical_notes":d.medical_notes or "",
+                            "is_available":d.is_available} for d in _exp_donors]
+                st.download_button("⬇️ Export Donors CSV", pd.DataFrame(_d_rows).to_csv(index=False),
+                                   "donors_backup.csv", "text/csv", use_container_width=True)
+        with ec2:
+            if _exp_reqs:
+                _r_rows = [{"patient_name":r.patient_name,"age":r.age,"blood_type":r.blood_type,
+                            "required_donation":r.required_donation,"hospital_name":r.hospital_name,
+                            "city":r.city,"state":r.state,"urgency_level":r.urgency_level,
+                            "contact_name":r.contact_name,"contact_phone":r.contact_phone,
+                            "contact_email":r.contact_email,"medical_description":r.medical_description or ""} for r in _exp_reqs]
+                st.download_button("⬇️ Export Requests CSV", pd.DataFrame(_r_rows).to_csv(index=False),
+                                   "requests_backup.csv", "text/csv", use_container_width=True)
+
+        st.markdown("### Import")
+        imp_c1, imp_c2 = st.columns(2)
+        with imp_c1:
+            donors_file = st.file_uploader("Upload donors_backup.csv", type="csv", key="imp_donors")
+            if donors_file and st.button("📥 Import Donors", use_container_width=True, key="do_imp_donors"):
+                try:
+                    df_imp = pd.read_csv(io.StringIO(donors_file.read().decode("utf-8")))
+                    db = get_session()
+                    added = 0
+                    for _, row in df_imp.iterrows():
+                        lat, lon = CITY_COORDS.get(str(row.get("city","")), (20.5937, 78.9629))
+                        db.add(Donor(
+                            name=str(row["name"]), age=int(row["age"]),
+                            blood_type=str(row["blood_type"]), email=str(row["email"]),
+                            phone=str(row["phone"]), city=str(row["city"]),
+                            state=str(row["state"]), country="India",
+                            latitude=lat, longitude=lon,
+                            donation_types=str(row["donation_types"]),
+                            medical_notes=str(row.get("medical_notes","")) or None,
+                            is_available=bool(row.get("is_available", True)),
+                        ))
+                        added += 1
+                    db.commit(); db.close()
+                    st.success(f"✅ Imported {added} donors!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Import failed: {e}")
+
+        with imp_c2:
+            reqs_file = st.file_uploader("Upload requests_backup.csv", type="csv", key="imp_reqs")
+            if reqs_file and st.button("📥 Import Requests", use_container_width=True, key="do_imp_reqs"):
+                try:
+                    df_imp = pd.read_csv(io.StringIO(reqs_file.read().decode("utf-8")))
+                    db = get_session()
+                    added = 0
+                    for _, row in df_imp.iterrows():
+                        lat, lon = CITY_COORDS.get(str(row.get("city","")), (20.5937, 78.9629))
+                        db.add(UrgentRequest(
+                            patient_name=str(row["patient_name"]), age=int(row["age"]),
+                            blood_type=str(row["blood_type"]),
+                            required_donation=str(row["required_donation"]),
+                            hospital_name=str(row["hospital_name"]),
+                            city=str(row["city"]), state=str(row["state"]), country="India",
+                            latitude=lat, longitude=lon,
+                            urgency_level=str(row.get("urgency_level","High")),
+                            contact_name=str(row["contact_name"]),
+                            contact_phone=str(row["contact_phone"]),
+                            contact_email=str(row["contact_email"]),
+                            medical_description=str(row.get("medical_description","")) or None,
+                        ))
+                        added += 1
+                    db.commit(); db.close()
+                    st.success(f"✅ Imported {added} requests!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Import failed: {e}")
+
+    st.divider()
     tab_d, tab_r, tab_m = st.tabs(["🧑‍⚕️ Donors", "🆘 Requests", "🔗 Match History"])
 
     with tab_d:
