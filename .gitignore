@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+.env
+donation_platform.db
+*.db
+.DS_Store
