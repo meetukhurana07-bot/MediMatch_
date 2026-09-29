@@ -979,7 +979,23 @@ elif page == "📋 Manage Records":
             "Use **Export** to save your data as CSV, and **Import** to restore it after a reset."
         )
 
-    with st.expander("💾 Backup & Restore Data", expanded=False):
+    with st.expander("💾 Backup & Restore Data", expanded=True):
+        # ── Clean up duplicates ───────────────────────────────────────────────
+        st.markdown("### 🧹 Clean Up Duplicates")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("🗑️ Delete ALL Donors & start fresh", use_container_width=True, type="primary"):
+                db = get_session()
+                db.query(Donor).delete(); db.query(Match).delete(); db.commit(); db.close()
+                st.success("All donors and matches deleted. Now re-import your CSV.")
+                st.rerun()
+        with cc2:
+            if st.button("🗑️ Delete ALL Requests & start fresh", use_container_width=True, type="primary"):
+                db = get_session()
+                db.query(UrgentRequest).delete(); db.query(Match).delete(); db.commit(); db.close()
+                st.success("All requests and matches deleted. Now re-import your CSV.")
+                st.rerun()
+        st.divider()
         st.markdown("### Export")
         db = get_session()
         _exp_donors = db.query(Donor).all()
@@ -1013,22 +1029,32 @@ elif page == "📋 Manage Records":
                 try:
                     df_imp = pd.read_csv(io.StringIO(donors_file.read().decode("utf-8")))
                     db = get_session()
-                    added = 0
+                    # Build a set of existing (email, phone) pairs to detect duplicates
+                    existing_donors = {(d.email.strip().lower(), d.phone.strip())
+                                       for d in db.query(Donor).all()}
+                    added = skipped = 0
                     for _, row in df_imp.iterrows():
+                        key = (str(row["email"]).strip().lower(), str(row["phone"]).strip())
+                        if key in existing_donors:
+                            skipped += 1
+                            continue
                         lat, lon = CITY_COORDS.get(str(row.get("city","")), (20.5937, 78.9629))
                         db.add(Donor(
                             name=str(row["name"]), age=int(row["age"]),
-                            blood_type=str(row["blood_type"]), email=str(row["email"]),
-                            phone=str(row["phone"]), city=str(row["city"]),
+                            blood_type=str(row["blood_type"]), email=str(row["email"]).strip(),
+                            phone=str(row["phone"]).strip(), city=str(row["city"]),
                             state=str(row["state"]), country="India",
                             latitude=lat, longitude=lon,
                             donation_types=str(row["donation_types"]),
                             medical_notes=str(row.get("medical_notes","")) or None,
                             is_available=bool(row.get("is_available", True)),
                         ))
+                        existing_donors.add(key)
                         added += 1
                     db.commit(); db.close()
-                    st.success(f"✅ Imported {added} donors!")
+                    msg = f"✅ Imported {added} donor(s)."
+                    if skipped: msg += f" Skipped {skipped} duplicate(s)."
+                    st.success(msg)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Import failed: {e}")
@@ -1039,14 +1065,25 @@ elif page == "📋 Manage Records":
                 try:
                     df_imp = pd.read_csv(io.StringIO(reqs_file.read().decode("utf-8")))
                     db = get_session()
-                    added = 0
+                    # Deduplicate on (patient_name, hospital_name, required_donation)
+                    existing_reqs = {(r.patient_name.strip().lower(),
+                                      r.hospital_name.strip().lower(),
+                                      r.required_donation.strip().lower())
+                                     for r in db.query(UrgentRequest).all()}
+                    added = skipped = 0
                     for _, row in df_imp.iterrows():
+                        key = (str(row["patient_name"]).strip().lower(),
+                               str(row["hospital_name"]).strip().lower(),
+                               str(row["required_donation"]).strip().lower())
+                        if key in existing_reqs:
+                            skipped += 1
+                            continue
                         lat, lon = CITY_COORDS.get(str(row.get("city","")), (20.5937, 78.9629))
                         db.add(UrgentRequest(
-                            patient_name=str(row["patient_name"]), age=int(row["age"]),
+                            patient_name=str(row["patient_name"]).strip(), age=int(row["age"]),
                             blood_type=str(row["blood_type"]),
                             required_donation=str(row["required_donation"]),
-                            hospital_name=str(row["hospital_name"]),
+                            hospital_name=str(row["hospital_name"]).strip(),
                             city=str(row["city"]), state=str(row["state"]), country="India",
                             latitude=lat, longitude=lon,
                             urgency_level=str(row.get("urgency_level","High")),
@@ -1055,9 +1092,12 @@ elif page == "📋 Manage Records":
                             contact_email=str(row["contact_email"]),
                             medical_description=str(row.get("medical_description","")) or None,
                         ))
+                        existing_reqs.add(key)
                         added += 1
                     db.commit(); db.close()
-                    st.success(f"✅ Imported {added} requests!")
+                    msg = f"✅ Imported {added} request(s)."
+                    if skipped: msg += f" Skipped {skipped} duplicate(s)."
+                    st.success(msg)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Import failed: {e}")
