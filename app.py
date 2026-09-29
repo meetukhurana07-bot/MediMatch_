@@ -357,12 +357,12 @@ def _deadline_str(deadline):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _MODEL_FALLBACKS = [
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
 ]
-_AI_MODEL = "gemini-2.5-flash-preview-05-20"
+
+_AI_MODEL = "gemini-3.7-flash"
 
 _SYSTEM_PROMPT = (
     "You are MediMatch AI, a medical assistant specialising in blood and organ donation. "
@@ -382,7 +382,6 @@ def _cfg(**kw):
     return types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT, **kw)
 
 
-@st.cache_resource(show_spinner=False)
 def _resolve_model() -> str:
     global _AI_MODEL
     try:
@@ -435,14 +434,43 @@ def ai_analyse_match(donor, request, result):
 def ai_chat(user_msg, history, context=None):
     if not _rate_check_ai():
         return "Rate limit reached. Please wait a moment before sending another message."
-    try:
-        chat = _make_client().chats.create(
-            model=_resolve_model(), config=_cfg(temperature=0.7, max_output_tokens=2048),
-            history=[types.Content(role=m["role"], parts=[types.Part(text=m["parts"][0])]) for m in history])
-        msg = f"[Context: {context}]\n\n{user_msg}" if context else user_msg
-        return chat.send_message(msg).text
-    except Exception as e:
-        return f"AI error: {e}"
+
+    client = _make_client()
+    msg = f"[Context: {context}]\n\n{user_msg}" if context else user_msg
+
+    models_to_try = [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ]
+
+    last_error = None
+
+    for model in models_to_try:
+        try:
+            chat = client.chats.create(
+                model=model,
+                config=_cfg(temperature=0.7, max_output_tokens=2048),
+                history=[
+                    types.Content(
+                        role=m["role"],
+                        parts=[types.Part(text=m["parts"][0])]
+                    )
+                    for m in history
+                ]
+            )
+
+            return chat.send_message(msg).text
+
+        except Exception as e:
+            last_error = e
+
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                continue
+
+            return f"AI error: {e}"
+
+    return f"AI error: All available Gemini models are temporarily unavailable. Last error: {last_error}"
 
 
 def ai_broadcast(req):
